@@ -1,0 +1,7 @@
+data/
+dataset/
+generated_samples/
+outputs/
+results/
+*.csv
+*.zip
