@@ -1,9 +1,11 @@
 
 import torch
 
+from .optimal_transport import OTPlanSampler
+
 class ConditionalFlowMatcher:
     
-    def __init__(self, sigma):
+    def __init__(self, sigma: float = 0.0):
         self.sigma = sigma
     
     @staticmethod
@@ -26,7 +28,7 @@ class ConditionalFlowMatcher:
     
     def sample_xt(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor, epsilon: torch.Tensor) -> torch.Tensor:
 
-        sigma_t = self.get_sigma_t().type_as(x0)
+        sigma_t = self.get_sigma_t()
         sigma_t = self.pad_t_like_x(sigma_t, x0)
         mu_t = self.get_mu_t(x0, x1, t)
 
@@ -37,13 +39,10 @@ class ConditionalFlowMatcher:
         returns conditional vector field ut(x1|x0) = x1 - x0
         """
         return x1 - x0
-
-    def sample_t(self):
-        return torch.rand()
     
     def get_sample_location_and_conditional_flow(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 
-        t = self.sample_t()
+        t = t if t is not None else torch.rand(x0.shape[0]).type_as(x0)
         t = self.pad_t_like_x(t, x0)
         eps = self.sample_noise_like(x0)
 
@@ -51,4 +50,4 @@ class ConditionalFlowMatcher:
 
         ut = self.get_conditional_vector_field(x0, x1, t)
 
-        return xt, ut
+        return t, xt, ut
