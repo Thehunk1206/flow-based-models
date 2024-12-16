@@ -40,7 +40,7 @@ class ConditionalFlowMatcher:
         """
         return x1 - x0
     
-    def get_sample_location_and_conditional_flow(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def get_sample_location_and_conditional_flow(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor=None) -> torch.Tensor:
 
         t = t if t is not None else torch.rand(x0.shape[0]).type_as(x0)
         t = self.pad_t_like_x(t, x0)

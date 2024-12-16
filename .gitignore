@@ -6,3 +6,5 @@ results/
 *.csv
 *.zip
 __pycache__/
+*.log
+logs/
