@@ -1,56 +1,72 @@
+import argparse
 import copy
 import math
 import os
 
 import torch
-from absl import app, flags
-from torch.nn.parallel import DistributedDataParallel
-from torch import distributed as dist
-from torch.utils.data import DistributedSampler
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from tqdm import trange
+from torch.utils.tensorboard import SummaryWriter
 
-# from torchvision.transforms import ToPILImage
-from torchvision.utils import make_grid, save_image
+from torchvision.utils import save_image
 
 from utils.data_loader import UnlabeledImageDataset
 from utils.sampler import euler_solver, heun_solver
-
-use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
 
 from conditional_flow_matcher import ConditionalFlowMatcher, OptimalTransportConditionalFlowMatcher
 from models.unet_model import UNetModelWrapper
 
 
-### Set Environment Variables ###
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+# ### Set Environment Variables ###
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 os.environ["WORLD_SIZE"] = "1"
 
-FLAGS = flags.FLAGS
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Flow Matching Training Script")
+    
+    # Model configuration
+    parser.add_argument("--model", type=str, default="otcfm", choices=["otcfm", "icfm"], 
+                        help="Flow matching model type")
+    parser.add_argument("--output_dir", type=str, default="./outputs/results_flickr_exp3/", 
+                        help="Output directory")
+    
+    # UNet configuration
+    parser.add_argument("--num_channel", type=int, default=128, 
+                        help="Base channel of UNet")
+    
+    # Training hyperparameters
+    parser.add_argument("--lr", type=float, default=1e-4, 
+                        help="Target learning rate")
+    parser.add_argument("--grad_clip", type=float, default=1.0, 
+                        help="Gradient norm clipping")
+    parser.add_argument("--total_steps", type=int, default=1000001, 
+                        help="Total training steps")
+    parser.add_argument("--warmup", type=int, default=10000, 
+                        help="Learning rate warmup steps")
+    parser.add_argument("--batch_size", type=int, default=32, 
+                        help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=4, 
+                        help="Number of workers for DataLoader")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, 
+                        help="EMA decay rate")
+    
+    # Evaluation parameters
+    parser.add_argument("--save_step", type=int, default=10000, 
+                        help="Frequency of saving checkpoints (0 to disable)")
+    
+    # Image dataset parameters
+    parser.add_argument("--image_dir", type=str, 
+                        default="/disk1/BharatDiffusion/kohya_ss/experimental_sricpts/real_faces_128", 
+                        help="Directory containing training images")
+    
+    # Logging parameters
+    parser.add_argument("--log_dir", type=str, default="./logs", 
+                        help="TensorBoard log directory")
+    
+    return parser.parse_args()
 
-flags.DEFINE_string("model", "otcfm", help="flow matching model type")
-flags.DEFINE_string("output_dir", "./outputs/results_flickr_exp3/", help="output_directory")
-# UNet
-flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
-
-# Training
-flags.DEFINE_float("lr", 1e-4, help="target learning rate")  # TRY 2e-4
-flags.DEFINE_float("grad_clip", 1.0, help="gradient norm clipping")
-flags.DEFINE_integer(
-    "total_steps", 1000001, help="total training steps"
-) 
-flags.DEFINE_integer("warmup", 10000, help="learning rate warmup")
-flags.DEFINE_integer("batch_size", 32, help="batch size")  # Lipman et al uses 128
-flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
-flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
-
-# Evaluation
-flags.DEFINE_integer(
-    "save_step",
-    10000,
-    help="frequency of saving checkpoints, 0 to disable during training",
-)
 
 def generate_samples(
     model, 
@@ -63,7 +79,7 @@ def generate_samples(
 ):
     """
     Generate samples using Euler or Euler-Heun method.
-
+    
     Parameters
     ----------
     model:
@@ -82,6 +98,9 @@ def generate_samples(
         integration method to use ('euler' or 'euler_heun').
     """
     _supported_method = ["euler", "heun"]
+    
+    # Determine device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Ensure the model is in evaluation mode
     model.eval()
@@ -119,9 +138,11 @@ def generate_samples(
     )
 
     model.train()
+    return traj
 
 
 def ema(source, target, decay):
+    """Exponential Moving Average update."""
     source_dict = source.state_dict()
     target_dict = target.state_dict()
     for key in source_dict.keys():
@@ -131,139 +152,150 @@ def ema(source, target, decay):
 
 
 def infiniteloop(dataloader):
+    """Create an infinite loop over the dataloader."""
     while True:
-        # for x, y in iter(dataloader):
         for x in iter(dataloader):
             yield x
 
-def warmup_lr(step):
-    return min(step, FLAGS.warmup) / FLAGS.warmup
+
+def warmup_lr(step, warmup_steps):
+    """Linear warmup learning rate scheduler."""
+    return min(step, warmup_steps) / warmup_steps
 
 
-def train(rank: torch.device, argv):
-    print(
-        "lr, total_steps, ema decay, save_step:",
-        FLAGS.lr,
-        FLAGS.total_steps,
-        FLAGS.ema_decay,
-        FLAGS.save_step,
-    )
-
-    batch_size_per_gpu = FLAGS.batch_size
-
-    # DATASETS/DATALOADER
-    # dataset = datasets.CIFAR10(
-    #     root="./data",
-    #     train=True,
-    #     download=True,
-    #     transform=transforms.Compose(
-    #         [
-    #             transforms.RandomHorizontalFlip(),
-    #             transforms.ToTensor(),
-    #             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    #         ]
-    #     ),
-    # )
+def train(args):
+    """Main training function."""
+    # Determine device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create output and log directories
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    
+    # TensorBoard writer
+    writer = SummaryWriter(log_dir=args.log_dir)
+    
+    # Transformations
     transform = transforms.Compose([
-        transforms.Resize((128, 128)),   # Resize images to 256x256
-        # transforms.CenterCrop((64, 128)),  # Crop the center 256x256
+        transforms.Resize((128, 128)),
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),            # Convert image to tensor
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
+    # Dataset and DataLoader
     dataset = UnlabeledImageDataset(
-        image_dir="/disk1/BharatDiffusion/kohya_ss/experimental_sricpts/real_faces_128",
+        image_dir=args.image_dir,
         transform=transform
     )
-
     
-    dataloader = torch.utils.data.DataLoader(
+    dataloader = DataLoader(
         dataset,
-        batch_size=batch_size_per_gpu,
-        shuffle= True,
-        num_workers=FLAGS.num_workers,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
         drop_last=True,
     )
 
     datalooper = infiniteloop(dataloader)
 
     # Calculate number of epochs
-    steps_per_epoch = math.ceil(len(dataset) / FLAGS.batch_size)
-    num_epochs = math.ceil(FLAGS.total_steps / steps_per_epoch)
+    steps_per_epoch = math.ceil(len(dataset) / args.batch_size)
+    num_epochs = math.ceil(args.total_steps / steps_per_epoch)
 
-    # MODELS
+    # Model initialization
     net_model = UNetModelWrapper(
         dim=(3, 128, 128),
         num_res_blocks=2,
-        num_channels=FLAGS.num_channel,
+        num_channels=args.num_channel,
         channel_mult=[1, 2, 2, 2],
         num_heads=4,
         num_head_channels=64,
         attention_resolutions="16",
         dropout=0.1,
-    ).to(
-        rank
-    )  # new dropout + bs of 128
+    ).to(device)
 
+    # Model size logging
+    model_size = sum(p.data.nelement() for p in net_model.parameters())
+    print(f"Model params: {model_size / 1024 / 1024:.2f} M")
+
+    # EMA Model
     ema_model = copy.deepcopy(net_model)
-    optim = torch.optim.AdamW(net_model.parameters(), lr=FLAGS.lr)
-    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
 
-    # show model size
-    model_size = 0
-    for param in net_model.parameters():
-        model_size += param.data.nelement()
-    print("Model params: %.2f M" % (model_size / 1024 / 1024))
+    # Optimizer and Scheduler
+    optim = torch.optim.AdamW(net_model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lambda step: warmup_lr(step, args.warmup))
 
-    #################################
-    #            OT-CFM
-    #################################
-
+    # Flow Matcher initialization
     sigma = 0.0
-    if FLAGS.model == "otcfm":
+    if args.model == "otcfm":
         FM = OptimalTransportConditionalFlowMatcher(sigma=sigma, ot_method='exact')
-    elif FLAGS.model == "icfm":
+    elif args.model == "icfm":
         FM = ConditionalFlowMatcher(sigma=sigma)
     else:
         raise NotImplementedError(
-            f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm']"
+            f"Unknown model {args.model}, must be one of ['otcfm', 'icfm']"
         )
 
-    savedir = FLAGS.output_dir + FLAGS.model + "/"
+    # Directories
+    savedir = os.path.join(args.output_dir, args.model)
     os.makedirs(savedir, exist_ok=True)
 
-    global_step = 0  # to keep track of the global step in training loop
+    global_step = 0
     
-    #TODO: Add a perceptual loss
+    # Training Loop
     with trange(num_epochs, dynamic_ncols=True) as epoch_pbar:
         for epoch in epoch_pbar:
             epoch_pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
 
-            with trange(steps_per_epoch, dynamic_ncols=True) as step_pbar:
+            with trange(args.total_steps , dynamic_ncols=True) as step_pbar:
                 for step in step_pbar:
-                    global_step += step
+                    global_step += 1
 
                     optim.zero_grad()
-                    x1 = next(datalooper).to(rank)
+                    
+                    # Get batch
+                    x1 = next(datalooper).to(device)
                     x0 = torch.randn_like(x1)
+                    
+                    # Flow matching core
                     t, xt, ut = FM.get_sample_location_and_conditional_flow(x0, x1)
                     vt = net_model(t, xt)
                     loss = torch.mean((vt - ut) ** 2)
+                    
+                    # Backward pass
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
+                    torch.nn.utils.clip_grad_norm_(net_model.parameters(), args.grad_clip)
                     optim.step()
                     sched.step()
-                    ema(net_model, ema_model, FLAGS.ema_decay)  # new
+                    
+                    # EMA update
+                    ema(net_model, ema_model, args.ema_decay)
 
-                    # sample and Saving the weights
-                    if FLAGS.save_step > 0 and global_step % FLAGS.save_step == 0:
-                        generate_samples(
-                            net_model, savedir, global_step, image_size=(128,128), net_="normal", grid_size=(5,5)
+                    # Logging
+                    writer.add_scalar('Training/Loss', loss.item(), global_step)
+                    writer.add_scalar('Learning Rate', optim.param_groups[0]['lr'], global_step)
+
+                    # Sample and save
+                    if args.save_step > 0 and global_step % args.save_step == 0:
+                        # Generate and save samples
+                        normal_net_sample = generate_samples(
+                            net_model, savedir, global_step, 
+                            image_size=(128,128), net_="normal", grid_size=(5,5)
                         )
-                        generate_samples(
-                            ema_model, savedir, global_step, image_size=(128,128), net_="ema", grid_size=(5,5)
+                        ema_net_sample = generate_samples(
+                            ema_model, savedir, global_step, 
+                            image_size=(128,128), net_="ema", grid_size=(5,5)
                         )
+
+                        # Log generated Image.
+                        writer.add_images(
+                            "Validation/NormalNet", normal_net_sample, global_step
+                        )
+                        writer.add_images(
+                            "Validation/EmaNet", ema_net_sample, global_step)
+                        
+                        # Save model checkpoints
                         torch.save(
                             {
                                 "net_model": net_model.state_dict(),
@@ -272,16 +304,20 @@ def train(rank: torch.device, argv):
                                 "optim": optim.state_dict(),
                                 "step": global_step,
                             },
-                            savedir + f"{FLAGS.model}_weights_step_{global_step}.pt",
+                            os.path.join(savedir, f"{args.model}_weights_step_{global_step}.pt"),
                         )
+                    
                     step_pbar.set_description(f"loss: {loss.item():.4f}")
 
+    # Close TensorBoard writer
+    writer.close()
 
-def main(argv):
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-    train(rank=device, argv=argv)
+
+def main():
+    """Main entry point."""
+    args = parse_arguments()
+    train(args)
 
 
 if __name__ == "__main__":
-    app.run(main)
+    main()
