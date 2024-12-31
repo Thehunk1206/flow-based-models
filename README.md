@@ -165,28 +165,25 @@ run_experiment "model_type" "learning_rate" "batch_size" "total_steps" "experime
 ## 📊 Experimental Results
 
 ### Model Comparison Study
-![5 Steps](assets/comparison_20241230_125636/comparison_steps5.png)
-![10 Steps](assets/comparison_20241230_125636/comparison_steps10.png)
-![20 Steps](assets/comparison_20241230_125636/comparison_steps20.png)
-![50 Steps](assets/comparison_20241230_125636/comparison_steps50.png)
-![100 Steps](assets/comparison_20241230_125636/comparison_steps100.png)
+<img src="assets/comparison_20241230_125636/comparison_steps5.png" width="400"/>
+<img src="assets/comparison_20241230_125636/comparison_steps10.png" width="400"/>
+<img src="assets/comparison_20241230_125636/comparison_steps20.png" width="400"/>
+<img src="assets/comparison_20241230_125636/comparison_steps50.png" width="400"/>
+<img src="assets/comparison_20241230_125636/comparison_steps100.png" width="400"/>
 
 ### Model Variants and Sample Outputs
 
 #### 1. Independent CFM (ICFM) Default Configuration
-![ICFM Grid](assets/sample_icfm_default/grid_batch_000.png)
-![ICFM Progress](assets/sample_icfm_default/intermediates/progress_batch_000.png)
-
+<img src="assets/sample_icfm_default/grid_batch_000.png" width="400"/>
+<img src="assets/sample_icfm_default/intermediates/progress_batch_000.png" width="400"/>
 
 #### 2. Optimal Transport CFM (OT-CFM) Default Configuration
-![OTCFM Grid](assets/sample_ot-cfm_default/grid_batch_000.png)
-![OTCFM Progress](assets/sample_ot-cfm_default/intermediates/progress_batch_000.png)
-
+<img src="assets/sample_ot-cfm_default/grid_batch_000.png" width="400"/>
+<img src="assets/sample_ot-cfm_default/intermediates/progress_batch_000.png" width="400"/>
 
 #### 3. OT-CFM Large Batch Configuration
-![OTCFM-LB Grid](assets/sample_ot-cfm_large_batch/grid_batch_000.png)
-![OTCFM-LB Progress](assets/sample_ot-cfm_large_batch/intermediates/progress_batch_000.png)
-
+<img src="assets/sample_ot-cfm_large_batch/grid_batch_000.png" width="400"/>
+<img src="assets/sample_ot-cfm_large_batch/intermediates/progress_batch_000.png" width="400"/>
 ## 🤝 Contributing
 We welcome contributions! Please feel free to submit a Pull Request.
 
