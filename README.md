@@ -184,8 +184,8 @@ run_experiment "model_type" "learning_rate" "batch_size" "total_steps" "experime
 
 
 #### 3. OT-CFM Large Batch Configuration
-![OTCFM-LB Grid](sample_ot-cfm_large_batch/grid_batch_000.png)
-![OTCFM-LB Progress](sample_ot-cfm_large_batch/intermediates/progress_batch_000.png)
+![OTCFM-LB Grid](assets/sample_ot-cfm_large_batch/grid_batch_000.png)
+![OTCFM-LB Progress](assets/sample_ot-cfm_large_batch/intermediates/progress_batch_000.png)
 
 ## 🤝 Contributing
 We welcome contributions! Please feel free to submit a Pull Request.
