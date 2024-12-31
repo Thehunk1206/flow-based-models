@@ -26,9 +26,10 @@ run_experiment() {
     local lr=$2
     local batch_size=$3
     local total_steps=$4
+    local experiment_name=$5
 
     # Create a unique experiment key
-    local experiment_key="${model}_${lr}_${batch_size}_${total_steps}"
+    local experiment_key="${model}_${lr}_${batch_size}_${experiment_name}"
 
     # Check if this experiment is already completed
     if is_experiment_completed "$experiment_key"; then
@@ -41,10 +42,11 @@ run_experiment() {
     echo "Learning Rate: $lr"
     echo "Batch Size: $batch_size"
     echo "Total Steps: $total_steps"
+    echo "Experiment Name: $experiment_name"
 
     # Construct the output and log directories
-    output_dir="./outputs/results_${model}_${batch_size}_${total_steps}_exp/"
-    log_dir="./logs/${model}_${batch_size}_${total_steps}_logs/"
+    output_dir="./outputs/results_${model}_${batch_size}_${experiment_name}_exp/"
+    log_dir="./logs/${model}_${batch_size}_${experiment_name}_logs/"
 
     # Ensure output and log directories exist
     mkdir -p "$output_dir" "$log_dir"
@@ -83,12 +85,12 @@ touch "$COMPLETED_EXPERIMENTS_FILE"
 
 # Run experiments
 # Experiment 1: OTCFM with default settings
-run_experiment "otcfm" 1e-4 16 1000000 || echo "Experiment 1 failed"
+run_experiment "otcfm" 1e-4 16 2000000 "otcfm-default" || echo "Experiment 1 failed"
 
 # Experiment 2: OTCFM with bigger batch-size
-run_experiment "otcfm" 1e-4 32 1000000 || echo "Experiment 2 failed"
+run_experiment "otcfm" 1e-4 32 2000000 "otcfm-large-batch" || echo "Experiment 2 failed"
 
 # Experiment 3: ICFM with default settings
-run_experiment "icfm" 1e-4 16 1000000 || echo "Experiment 3 failed"
+run_experiment "icfm" 1e-4 16 2000000 "icfm-default" || echo "Experiment 3 failed"
 
 echo "Experiment script completed. Check completed_experiments.log for details."

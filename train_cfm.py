@@ -9,10 +9,13 @@ from torchvision import transforms
 from tqdm import trange
 from torch.utils.tensorboard import SummaryWriter
 
-from torchvision.utils import save_image
-
 from utils.data_loader import UnlabeledImageDataset
-from utils.sampler import euler_solver, heun_solver
+from utils.train_utils import (generate_samples, 
+                                find_latest_checkpoint, 
+                                cleanup_old_checkpoints, 
+                                ema, infiniteloop, 
+                                warmup_lr
+                            )
 
 from conditional_flow_matcher import ConditionalFlowMatcher, OptimalTransportConditionalFlowMatcher
 from models.unet_model import UNetModelWrapper
@@ -65,102 +68,11 @@ def parse_arguments():
     parser.add_argument("--log_dir", type=str, default="./logs", 
                         help="TensorBoard log directory")
     
+    # last n checkpoints to save, delete the rest checkpoints for saving the disk space
+    parser.add_argument("--keep_n_checkpoints", type=int, default=10,
+                        help="Number of previous checkpoints to keep")
+    
     return parser.parse_args()
-
-
-def generate_samples(
-    model, 
-    savedir, 
-    step, 
-    image_size:tuple=(32,32), 
-    net_="normal", 
-    grid_size=(8, 8), 
-    method='euler'
-):
-    """
-    Generate samples using Euler or Euler-Heun method.
-    
-    Parameters
-    ----------
-    model:
-        represents the neural network that we want to generate samples from.
-    savedir: str
-        represents the path where we want to save the generated images.
-    step: int
-        represents the current step of training.
-    image_size: tuple
-        size of the generated images.
-    net_: str
-        network type identifier.
-    grid_size: tuple
-        represents the grid size for arranging the generated images.
-    method: str
-        integration method to use ('euler' or 'euler_heun').
-    """
-    _supported_method = ["euler", "heun"]
-    
-    # Determine device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Ensure the model is in evaluation mode
-    model.eval()
-
-    model_ = copy.deepcopy(model)
-
-    # Prepare integration parameters
-    with torch.no_grad():
-        # Adjust the tensor size based on grid_size
-        num_images = grid_size[0] * grid_size[1]
-        
-        # Generate initial random noise
-        x0 = torch.randn(num_images, 3, image_size[0], image_size[1], device=device)
-        
-        # Create time span for integration
-        t_span = torch.linspace(0, 1, 100, device=device)
-        
-        # Choose integration method
-        if method == 'euler':
-            traj = euler_solver(model_, x0, t_span, device=device)
-        elif method == 'heun':
-            traj = heun_solver(model_, x0, t_span, device=device)
-        else:
-            raise ValueError(f"Unsupported integration method: {method}, supported methods: {_supported_method}")
-        
-        # Post-process the trajectory
-        traj = traj.view([-1, 3, image_size[0], image_size[1]]).clip(-1, 1)
-        traj = traj / 2 + 0.5
-    
-    # Save the generated images
-    save_image(
-        traj, 
-        f"{savedir}{net_}_generated_FM_images_step_{step}.png", 
-        nrow=grid_size[0]
-    )
-
-    model.train()
-    return traj
-
-
-def ema(source, target, decay):
-    """Exponential Moving Average update."""
-    source_dict = source.state_dict()
-    target_dict = target.state_dict()
-    for key in source_dict.keys():
-        target_dict[key].data.copy_(
-            target_dict[key].data * decay + source_dict[key].data * (1 - decay)
-        )
-
-
-def infiniteloop(dataloader):
-    """Create an infinite loop over the dataloader."""
-    while True:
-        for x in iter(dataloader):
-            yield x
-
-
-def warmup_lr(step, warmup_steps):
-    """Linear warmup learning rate scheduler."""
-    return min(step, warmup_steps) / warmup_steps
 
 
 def train(args):
@@ -241,73 +153,88 @@ def train(args):
     savedir = os.path.join(args.output_dir, args.model)
     os.makedirs(savedir, exist_ok=True)
 
-    global_step = 0
+     # Load checkpoint if exists
+    start_step = 1    
+    latest_model = find_latest_checkpoint(savedir)
+    if latest_model:
+        checkpoint = torch.load(latest_model, map_location=device, weights_only=True)
+        net_model.load_state_dict(checkpoint['net_model'])
+        ema_model.load_state_dict(checkpoint['ema_model'])
+        optim.load_state_dict(checkpoint['optim'])
+        sched.load_state_dict(checkpoint['sched'])
+        start_step = checkpoint['step']
+        print(f"Resuming from step {start_step}")
+
+    # Ptach work for now. TODO: Remove the Global steps later
+    global_step = start_step
     
     # Training Loop
-    with trange(num_epochs, dynamic_ncols=True) as epoch_pbar:
-        for epoch in epoch_pbar:
-            epoch_pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
+    # with trange(num_epochs, dynamic_ncols=True) as epoch_pbar:
+    #     for epoch in epoch_pbar:
+    #         epoch_pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
 
-            with trange(args.total_steps , dynamic_ncols=True) as step_pbar:
-                for step in step_pbar:
-                    global_step += 1
+    with trange(start_step, args.total_steps, initial=start_step, total=args.total_steps, dynamic_ncols=True) as step_pbar:
+        for step in step_pbar:
+            global_step += 1
 
-                    optim.zero_grad()
-                    
-                    # Get batch
-                    x1 = next(datalooper).to(device)
-                    x0 = torch.randn_like(x1)
-                    
-                    # Flow matching core
-                    t, xt, ut = FM.get_sample_location_and_conditional_flow(x0, x1)
-                    vt = net_model(t, xt)
-                    loss = torch.mean((vt - ut) ** 2)
-                    
-                    # Backward pass
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net_model.parameters(), args.grad_clip)
-                    optim.step()
-                    sched.step()
-                    
-                    # EMA update
-                    ema(net_model, ema_model, args.ema_decay)
+            optim.zero_grad()
+            
+            # Get batch
+            x1 = next(datalooper).to(device)
+            x0 = torch.randn_like(x1)
+            
+            # Flow matching core
+            t, xt, ut = FM.get_sample_location_and_conditional_flow(x0, x1)
+            vt = net_model(t, xt)
+            loss = torch.mean((vt - ut) ** 2)
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net_model.parameters(), args.grad_clip)
+            optim.step()
+            sched.step()
+            
+            # EMA update
+            ema(net_model, ema_model, args.ema_decay)
 
-                    # Logging
-                    writer.add_scalar('Training/Loss', loss.item(), global_step)
-                    writer.add_scalar('Learning Rate', optim.param_groups[0]['lr'], global_step)
+            # Logging
+            writer.add_scalar('Training/Loss', loss.item(), global_step)
+            writer.add_scalar('Learning Rate', optim.param_groups[0]['lr'], global_step)
 
-                    # Sample and save
-                    if args.save_step > 0 and global_step % args.save_step == 0:
-                        # Generate and save samples
-                        normal_net_sample = generate_samples(
-                            net_model, savedir, global_step, 
-                            image_size=(128,128), net_="normal", grid_size=(5,5)
-                        )
-                        ema_net_sample = generate_samples(
-                            ema_model, savedir, global_step, 
-                            image_size=(128,128), net_="ema", grid_size=(5,5)
-                        )
+            # Sample and save
+            if args.save_step > 0 and global_step % args.save_step == 0:
+                # Generate and save samples
+                normal_net_sample = generate_samples(
+                    net_model, savedir, global_step, 
+                    image_size=(128,128), net_="normal", grid_size=(5,5)
+                )
+                ema_net_sample = generate_samples(
+                    ema_model, savedir, global_step, 
+                    image_size=(128,128), net_="ema", grid_size=(5,5)
+                )
 
-                        # Log generated Image.
-                        writer.add_images(
-                            "Validation/NormalNet", normal_net_sample, global_step
-                        )
-                        writer.add_images(
-                            "Validation/EmaNet", ema_net_sample, global_step)
-                        
-                        # Save model checkpoints
-                        torch.save(
-                            {
-                                "net_model": net_model.state_dict(),
-                                "ema_model": ema_model.state_dict(),
-                                "sched": sched.state_dict(),
-                                "optim": optim.state_dict(),
-                                "step": global_step,
-                            },
-                            os.path.join(savedir, f"{args.model}_weights_step_{global_step}.pt"),
-                        )
-                    
-                    step_pbar.set_description(f"loss: {loss.item():.4f}")
+                # Log generated Image.
+                writer.add_images(
+                    "Validation/NormalNet", normal_net_sample, global_step
+                )
+                writer.add_images(
+                    "Validation/EmaNet", ema_net_sample, global_step)
+
+                # Save model checkpoints
+                torch.save(
+                    {
+                        "net_model": net_model.state_dict(),
+                        "ema_model": ema_model.state_dict(),
+                        "sched": sched.state_dict(),
+                        "optim": optim.state_dict(),
+                        "step": global_step,
+                    },
+                    os.path.join(savedir, f"{args.model}_weights_step_{global_step}.pt"),
+                )
+
+                cleanup_old_checkpoints(savedir, args.keep_n_checkpoints)
+            
+            step_pbar.set_description(f"loss: {loss.item():.4f}")
 
     # Close TensorBoard writer
     writer.close()
